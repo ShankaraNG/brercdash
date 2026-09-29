@@ -1,0 +1,285 @@
+"""
+Main entry point and orchestrator for the BRERC ETL pipeline.
+Manages logging configuration, config caching, source/dictionary data ingestion
+(supporting both CSV and database modes), incremental vs initial load decisions,
+and nightly batch job execution.
+"""
+
+from functools import lru_cache
+import logging
+
+# Imports database connections and pipeline components
+
+import etl.columns as C
+from etl.columns import source_column
+from etl.db import (
+    check_table_exists,
+    check_table_has_rows,
+    get_destination_connection,
+    get_source_connection,
+)
+from etl.load.loader import load_safety_config
+from etl.load.metadata import get_last_load_date
+from etl.load.mode import should_run_initial_load
+from etl.load.reload import DatabaseMismatchError, force_full_reload
+from etl.nightly_pipeline import run_pipeline
+from etl.reconciliation.state import get_ui_map
+from etl.run_history import mark_run_failed, mark_run_successful, start_run
+from etl.safety_gate.rules import (
+    SensitiveSpeciesListUnavailable,
+    load_sensitive_species,
+)
+
+import pandas as pd
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def get_config() -> dict:
+    """Cached wrapper to load safety and pipeline configurations."""
+    return load_safety_config()
+
+
+def load_source_data(source_connection=None):
+    """
+    Loads every BRERC source occurrence record from either CSV files or a
+    database source. Always the full set: reconciliation works out what changed.
+    """
+    config = get_config()
+    mode = config["source"].get("mode", "csv")
+
+    if mode == "csv":
+        df = pd.read_csv(config["source"]["records_path"])
+
+        # CSV snapshots do not contain the production modification-date column.
+        # Add the configured column so downstream ETL components receive the
+        # same schema as the BRERC database source.
+        modified_col = source_column(C.MODIFIED_DATE)
+        if modified_col not in df.columns:
+            df[modified_col] = pd.Timestamp.now()
+
+    elif mode == "database":
+        if source_connection is None:
+            raise ValueError(
+                "source_connection is required when source.mode is 'database'"
+            )
+
+        df = pd.read_sql(
+            config["source"]["records_query"],
+            source_connection,
+        )
+
+    else:
+        raise ValueError(f"Unknown source.mode: {mode!r}")
+
+    return df
+
+
+def load_species_dictionary(source_connection=None):
+    """Loads the master species dictionary used for synonym-safe species resolution from CSV or database."""
+    config = get_config()
+    mode = config["source"].get("mode", "csv")
+
+    if mode == "csv":
+        return pd.read_csv(config["source"]["dictionary_path"])
+
+    if mode == "database":
+        if source_connection is None:
+            raise ValueError(
+                "source_connection is required when source.mode is 'database'"
+            )
+
+        return pd.read_sql(
+            config["source"]["dictionary_query"],
+            source_connection,
+        )
+
+    raise ValueError(f"Unknown source.mode: {mode!r}")
+
+
+def get_current_ui_map(connection):
+    """Retrieves the current occurrence_public state."""
+    return get_ui_map(connection)
+
+
+# Ordered most-specific-first: FileNotFoundError is itself an OSError, so it
+# must be checked before the general connection-failure case below it.
+def describe_failure(error: Exception) -> str:
+    """
+    Translates a raised exception into a short, plain-English reason for the
+    run-history dashboard, which BRERC staff (not just engineers) read. The
+    full technical error (message, traceback) is logged server-side via
+    logger.exception() below — only the exception's type name is stored
+    alongside this summary, since exception messages can otherwise carry
+    fragments of source data (a bad species code, a file path, a DB error
+    detail) onto a browser-accessible page.
+    """
+    if isinstance(error, SensitiveSpeciesListUnavailable):
+        return (
+            "The sensitive-species list could not be loaded, so the update "
+            "stopped before changing any data. Check that the file named in "
+            "config/safety.yaml (normally data/sensitive_species.csv) is in "
+            "place and has its species_no and nbn_number columns."
+        )
+    if isinstance(error, DatabaseMismatchError):
+        return (
+            "A safety check blocked a full database reset because the settings "
+            "pointed at two different databases. No data was changed — check the "
+            "database configuration."
+        )
+    if isinstance(error, FileNotFoundError):
+        return "A required data file could not be found."
+    if isinstance(error, OSError):
+        return "Couldn't connect to the database — it may be down or unreachable."
+    if isinstance(error, ValueError):
+        return "A problem was found in the source data (e.g. an unrecognised species code)."
+    if isinstance(error, KeyError):
+        return "The source data was missing an expected column."
+    if type(error).__module__.startswith("psycopg"):
+        return "A database error occurred while saving records."
+
+    return "An unexpected error occurred during the update."
+
+
+def nightly_job():
+    """Orchestrates the nightly ETL pipeline run."""
+    logger.info("Starting nightly ETL job pipeline.")
+
+    run_number = None
+
+    try:
+        config = get_config()
+        mode = config["source"].get("mode", "csv")
+
+        with get_destination_connection() as connection:
+            table_name = config["destination"]["table"]
+
+            table_exists = check_table_exists(connection, table_name)
+            table_has_rows = (
+                check_table_has_rows(connection, table_name)
+                if table_exists
+                else False
+            )
+
+            run_initial = should_run_initial_load(table_exists, table_has_rows)
+            load_mode = "initial" if run_initial else "incremental"
+
+            # A table with rows but no Load_date was never loaded by this
+            # pipeline, so it is rebuilt rather than reconciled.
+            if (
+                load_mode == "incremental"
+                and mode == "database"
+                and config["load"].get("incremental_check", True)
+            ):
+                if get_last_load_date(connection) is None:
+                    load_mode = "initial"
+
+            elif load_mode == "incremental" and mode == "database":
+                load_mode = "initial"
+
+            run_number = start_run(job_type=load_mode)
+
+            # Prove the sensitive-species list is loadable before ANYTHING
+            # writes. run_pipeline() has its own preflight, but on an initial
+            # run force_full_reload() resets the schema below, before the
+            # pipeline is reached — so the check has to happen here too for
+            # "the update stopped before changing any data" to be true in
+            # every mode. Placed after start_run() so a missing list is a
+            # visible failed run on the dashboard, not a silent no-op.
+            # The result is lru_cached; the later uses cost nothing extra.
+            load_sensitive_species()
+
+            if load_mode == "initial":
+                connection.commit()
+                logger.warning("Forcing full reload of table: %s", table_name)
+                force_full_reload()
+
+            if mode == "database":
+                with get_source_connection() as source_connection:
+                    # Every record, on incremental runs too. Reconciliation
+                    # needs the full set of ids to see deletions, and a
+                    # date_mdb_modified window misses edits that do not bump
+                    # that date (or are dated the day of the last load, since
+                    # it is a DATE compared against a timestamp). Only the
+                    # records that actually changed are processed and written.
+                    source_df = load_source_data(source_connection)
+                    aggregation_source_df = source_df
+                    dictionary_df = load_species_dictionary(
+                        source_connection
+                    )
+            else:
+                source_df = load_source_data()
+                aggregation_source_df = source_df
+                dictionary_df = load_species_dictionary()
+
+            ui_map = get_current_ui_map(connection)
+
+            logger.info("Running pipeline in '%s' mode.", load_mode)
+
+            result = run_pipeline(
+                source_df,
+                dictionary_df,
+                ui_map,
+                connection,
+                load_mode,
+                aggregation_source_df=aggregation_source_df,
+            )
+
+            # Read back the Load_date that upsert_provenance() just committed,
+            # so the run history reflects what's actually in the database
+            # rather than a separately-timed value from this process's clock.
+            with connection.cursor() as cur:
+                cur.execute('SELECT "Load_date" FROM provenance WHERE id = 1')
+                provenance_row = cur.fetchone()
+                db_load_date = provenance_row["Load_date"] if provenance_row else None
+
+                # How many records the public dashboard holds after this run,
+                # so a sudden drop stands out on the run-history dashboard.
+                cur.execute(f"SELECT COUNT(*) AS total FROM {table_name}")
+                total_records = cur.fetchone()["total"]
+
+        reconciliation_summary = result.get("reconciliation", {})
+        insert_count = len(reconciliation_summary.get("inserts", []))
+        update_count = len(reconciliation_summary.get("updates", []))
+        delete_count = len(reconciliation_summary.get("deletes", []))
+
+        logger.info(
+            "Nightly ETL completed successfully. Summary -> "
+            "Inserts: %d | Updates: %d | Deletes: %d | Unchanged: %d",
+            insert_count,
+            update_count,
+            delete_count,
+            len(reconciliation_summary.get("unchanged", [])),
+        )
+
+        mark_run_successful(
+            run_number,
+            load_no=db_load_date.isoformat() if db_load_date else None,
+            inserts=insert_count,
+            updates=update_count,
+            deletes=delete_count,
+            total_records=total_records,
+        )
+
+        return result
+
+    except Exception as error:
+        logger.exception("Nightly ETL failed: %s", error)
+
+        if run_number is not None:
+            mark_run_failed(
+                run_number,
+                error_message=type(error).__name__,
+                error_summary=describe_failure(error),
+            )
+
+        raise

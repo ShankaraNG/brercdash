@@ -1,0 +1,51 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Secrets / environment
+.env
+.env.*
+# keep the no-secrets template committed:
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+*.log
+
+# Cached third-party answers (species photo licences/descriptions, B8). Rebuilt
+# on demand — never commit it.
+.cache/
+
+# ETL run-history log (local runtime state) — never commit it.
+logs/
+
+# Data — never commit real/sensitive data (species locations, personal data).
+# The folder and its README are tracked; everything else inside is ignored.
+data/*
+!data/README.md
+
+# Local database / ETL configuration
+config/safety.yaml
+
+# BRERC live-view attestation evidence contains internal catalogue identifiers
+# and SQL. Keep raw captures in controlled storage; only reviewed public
+# contracts and explicitly approved fixtures belong in git.
+*.brerc-view-capture.json
+*.brerc-view-definition.sql
+*.brerc-view-approval.pending.json
+*.brerc-view-approval.json

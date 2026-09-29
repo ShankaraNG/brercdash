@@ -1,0 +1,180 @@
+"""
+Main execution pipeline orchestrator for the BRERC ETL process.
+Coordinates data cleaning, species resolution, spatial aggregation, database persistence,
+provenance tracking, and reconciliation into a single unified transactional run.
+"""
+
+# python -c "from etl.job import nightly_job; nightly_job()"
+from datetime import datetime, timezone
+import logging
+import time
+
+import etl.columns as C
+from etl.columns import to_pipeline_names
+from etl.profiling.cleaning import clean_data
+from etl.reconciliation.reconcile import reconcile
+from etl.aggregation.counts import build_public_aggregation
+from etl.aggregation.persist import persist_aggregation_outputs
+from etl.matching.species import resolve_species_numbers
+from etl.provenance import upsert_provenance
+from etl.load.loader import load_safety_config
+from etl.safety_gate.rules import load_sensitive_species
+
+logger = logging.getLogger(__name__)
+
+CONFIG = load_safety_config()
+
+
+def prepare_records(df):
+    """Cleans source records and translates them to pipeline column names."""
+    return to_pipeline_names(
+        clean_data(df),
+        "columns",
+        required=C.RECORD_COLUMNS_REQUIRED,
+        what="the source records",
+    )
+
+
+def prepare_dictionary(df):
+    """Cleans the species dictionary and translates it to pipeline column names."""
+    return to_pipeline_names(
+        clean_data(df),
+        "dictionary_columns",
+        required=C.DICTIONARY_COLUMNS_REQUIRED,
+        what="the species dictionary",
+    )
+
+
+def run_pipeline(
+    source_df,
+    dictionary_df,
+    ui_map,
+    connection,
+    load_mode,
+    aggregation_source_df=None,
+):
+    """
+    Executes the complete end-to-end ETL pipeline sequence:
+        1. Clean incoming source and dictionary dataframes.
+        2. Resolve species numbers against the master dictionary.
+        3. Build public spatial and taxonomic aggregation summaries.
+        4. Persist species index and aggregation outputs to the database.
+        5. Upsert pipeline execution provenance metadata.
+        6. Run two-pass occurrence record reconciliation against the UI state.
+
+    The load_mode ('initial' or 'incremental') is stamped onto every row written
+    during this execution via the 'Load' and 'Load_date' audit metadata columns.
+
+    source_df feeds reconciliation (step 6); on an incremental run it holds only
+    the records changed since the last load. The map cells and species index
+    (steps 3-4) are REPLACED every run, so they must be built from every record:
+    pass the full source as aggregation_source_df. Left as None, source_df is
+    used for both, which is right only when source_df is already complete.
+    """
+
+    start_time = time.time()
+    logger.info(
+        "Starting ETL pipeline execution with load_mode='%s' (%d source rows).",
+        load_mode,
+        len(source_df),
+    )
+
+    try:
+        # Step 0: Prove the sensitive-species list is loadable BEFORE any
+        # database write. The list is only consumed in step 6 (reconciliation's
+        # safety gate), but steps 4 and 5 have already replaced the public
+        # aggregation outputs and stamped a new provenance row by then — so
+        # without this preflight, a missing or unusable list still lands fresh
+        # public state before the run fails, which defeats the point of
+        # failing. Raising here means a failed run changed nothing. The result
+        # is lru_cached, so the real use in step 6 costs nothing extra.
+        load_sensitive_species()
+
+        # Step 1: Clean raw column names and formats
+        logger.info("SOURCE columns: %s", sorted(source_df.columns.tolist()))
+        logger.info("Cleaning source and dictionary dataframes...")
+        # From here on only the pipeline's own column names exist; every
+        # column safety.yaml does not map has been dropped.
+        cleaned_source = prepare_records(source_df)
+        cleaned_dictionary = prepare_dictionary(dictionary_df)
+        logger.info("CLEANED columns: %s", sorted(cleaned_source.columns.tolist()))
+
+        # Step 2: Match and resolve species identifiers (species_no)
+        logger.info("Resolving species numbers...")
+        resolved_source = resolve_species_numbers(
+            cleaned_source,
+            cleaned_dictionary,
+        )
+        logger.info("RESOLVED columns: %s", sorted(resolved_source.columns.tolist()))
+
+        # The aggregation input: every record, not just this run's changes.
+        # Building it from the incremental slice replaced the whole public map
+        # with only the records edited since the last run (none, on a quiet night).
+        if aggregation_source_df is None:
+            resolved_aggregation_source = resolved_source
+        else:
+            resolved_aggregation_source = resolve_species_numbers(
+                prepare_records(aggregation_source_df),
+                cleaned_dictionary,
+            )
+
+        # Step 3: Build derived public aggregation layers
+        logger.info(
+            "Building public aggregation layer from %d records...",
+            len(resolved_aggregation_source),
+        )
+        aggregation_outputs = build_public_aggregation(
+            resolved_aggregation_source,
+        )
+
+        # Step 4: Persist species index and suppression counts.
+        # This MUST happen before occurrence writes because occurrence tables
+        # maintain foreign key constraints pointing to the species table.
+        persist_aggregation_outputs(
+            connection,
+            species_index=aggregation_outputs["species_index"],
+            suppressed_counts=aggregation_outputs["aggregation"],
+            cell_size_m=CONFIG["aggregation"]["cell_size_m"],
+            load_mode=load_mode,
+        )
+
+        # Step 5: Update pipeline run metadata provenance
+        logger.info("Upserting pipeline provenance metadata...")
+        upsert_provenance(connection, load_mode=load_mode)
+
+        # Step 6: Synchronise and reconcile individual occurrence records
+        logger.info("Running occurrence record reconciliation...")
+        reconciliation_summary = reconcile(
+            resolved_source,
+            cleaned_dictionary,
+            ui_map,
+            connection,
+            load_mode=load_mode,
+            # UTC, and timezone-AWARE. datetime.now() returns a naive local time,
+            # and Postgres then has to guess what it means when writing it into
+            # Load_date (a TIMESTAMPTZ) — it assumes the server's own timezone.
+            #
+            # That guess is wrong whenever the machine running the ETL is not in
+            # the same timezone as the database. Running from Hong Kong against a
+            # Europe/London database, the stored Load_date lands 7 hours in the
+            # FUTURE. get_last_load_date() then uses it as the incremental
+            # watermark, nothing in the source can be newer than it, the load
+            # returns zero rows, and reconciliation reads "source is empty" as
+            # "everything was deleted" — emptying the public dashboard.
+            #
+            # It would also drift by an hour at each daylight-saving change even
+            # on a single machine.
+            load_timestamp=datetime.now(timezone.utc),
+        )
+
+        duration = time.time() - start_time
+        logger.info("ETL pipeline completed successfully in %.2f seconds.", duration)
+
+        return {
+            "reconciliation": reconciliation_summary,
+            "aggregation": aggregation_outputs,
+        }
+
+    except Exception as e:
+        logger.exception("ETL pipeline failed during execution: %s", e)
+        raise
