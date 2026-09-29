@@ -4,6 +4,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+.github/
 
 # Secrets / environment
 .env
