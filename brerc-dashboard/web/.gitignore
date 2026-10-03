@@ -1,0 +1,11 @@
+node_modules
+dist
+*.tsbuildinfo
+.env
+.env.local
+coverage
+test-results
+playwright-report
+screenshots
+.vite-cache
+public/maplibre-gl-worker.cjs
